@@ -330,7 +330,35 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         slot_idx: int | None = None,
     ) -> torch.Tensor:
-        """Prefill using FlashInfer (float32 state) with Triton fallback."""
+        """Prefill for GatedDeltaNet.
+
+        Two production paths:
+          * flashinfer.gdn_prefill (chunk kernel) — Hopper-tuned, float32
+            state, no O(T*H*V*K) intermediate tensors.
+          * Triton fla_ops.chunk — universal fallback, works on Ampere.
+
+        We skip the flashinfer path in three situations:
+          1. Ampere host detected (JIT-compiled sm_90 kernels break on
+             CUDA toolkits < 12.5 — see finding_a100_flashinfer_jit_trap).
+          2. `context.la_chunk_continuation == True` — we need to feed a
+             non-zero recurrent state through, and the current flashinfer
+             wrapper here always reads zeros; sticking to Triton keeps the
+             continuation math well-defined.
+          3. Import-time failure (also caught in the except).
+
+        Chunked-prefill continuation extension:
+          When `la_chunk_continuation` is True AND we have a slot_idx,
+          initialize the recurrent state from `recurrent_state_buf[slot]`
+          and prepend the saved `conv_state_buf[slot]` frame to `mixed_qkv`
+          before the causal conv1d.  Both buffers are updated after the
+          chunk so the next chunk (or the first decode step) reads the
+          correct continuation state.
+        """
+        from nanovllm.utils.context import get_context
+        from nanovllm.layers import flashinfer_attn as _fi
+        _ctx = get_context()
+        _la_cont = getattr(_ctx, "la_chunk_continuation", False)
+
         seq_len = hidden_states.shape[0]
         batch_size = 1
         hidden_states_3d = hidden_states.unsqueeze(0)
@@ -343,14 +371,31 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         b = self.in_proj_b(hidden_states_3d)
         a = self.in_proj_a(hidden_states_3d)
 
-        # Save conv state
-        if slot_idx is not None and self.conv_state_buf is not None:
-            self.conv_state_buf[slot_idx].copy_(
-                mixed_qkv[0, :, -(self.conv_kernel_size - 1):]
-            )
-
-        # Causal conv1d + SiLU
-        mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
+        # ---- Causal conv1d ----
+        # Standard case: use nn.Conv1d's builtin left-padding of (K-1) zeros
+        # and truncate the trailing (K-1) samples.  Continuation case:
+        # replace the zero pad with the saved conv_state (last K-1 frames
+        # from the previous chunk) so the causal receptive field crosses
+        # the chunk boundary correctly.
+        if (_la_cont and slot_idx is not None
+                and self.conv_state_buf is not None):
+            prev_conv = self.conv_state_buf[slot_idx].to(mixed_qkv.dtype)  # [D, K-1]
+            padded = torch.cat([prev_conv.unsqueeze(0), mixed_qkv], dim=-1)
+            # Update conv_state_buf with the LAST (K-1) frames of the padded
+            # buffer — that gives us a proper rolling window across chunks.
+            self.conv_state_buf[slot_idx].copy_(padded[0, :, -(self.conv_kernel_size - 1):])
+            conv_out = F.conv1d(padded, self.conv1d.weight, bias=self.conv1d.bias,
+                                padding=0, groups=self.conv1d.groups)
+            # padded len = (K-1) + T; conv without padding gives (K-1)+T - K + 1 = T.
+            mixed_qkv = F.silu(conv_out)
+        else:
+            # Standard first-chunk / one-shot prefill.  Save conv state for
+            # a subsequent decode step (or the next chunk).
+            if slot_idx is not None and self.conv_state_buf is not None:
+                self.conv_state_buf[slot_idx].copy_(
+                    mixed_qkv[0, :, -(self.conv_kernel_size - 1):]
+                )
+            mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
         mixed_qkv = mixed_qkv.transpose(1, 2)
 
         # Split Q, K, V (per-rank)
@@ -371,44 +416,52 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         save_state = (slot_idx is not None and self.recurrent_state_buf is not None)
 
-        h0 = torch.zeros(1, self.num_v_heads, self.head_v_dim, self.head_k_dim,
-                         dtype=torch.float32, device=hidden_states.device)
+        # Continuation h0 comes from the persistent buffer (float32).
+        # Non-continuation h0 = zeros (existing behaviour).
+        if _la_cont and save_state:
+            h0 = self.recurrent_state_buf[slot_idx].unsqueeze(0).to(torch.float32).contiguous()
+        else:
+            h0 = torch.zeros(1, self.num_v_heads, self.head_v_dim, self.head_k_dim,
+                             dtype=torch.float32, device=hidden_states.device)
 
-        # Use FlashInfer GDN prefill kernel when available (float32 inter-chunk state,
-        # no O(T*H*V*K) intermediate tensors — essential for long-context without OOM).
-        # Falls back to Triton fla_ops for short sequences or when flashinfer is absent.
-        try:
-            from flashinfer.gdn_prefill import chunk_gated_delta_rule as fi_chunk
-            from nanovllm.layers.fla_ops.l2norm import l2norm_fwd
-
-            q_normed = l2norm_fwd(query)
-            k_normed = l2norm_fwd(key)
-
-            T = seq_len
-            q_3d = q_normed.squeeze(0).contiguous()        # [T, H_v, K]
-            k_3d = k_normed.squeeze(0).contiguous()        # [T, H_v, K]
-            v_3d = value.squeeze(0).contiguous()            # [T, H_v, V]
-            g_2d = g.squeeze(0).contiguous().float()        # [T, H_v]
-            beta_2d = beta.squeeze(0).contiguous().float()  # [T, H_v]
-
-            cu_seqlens = torch.tensor([0, T], dtype=torch.int64, device=hidden_states.device)
-
-            result = fi_chunk(
-                q=q_3d, k=k_3d, v=v_3d,
-                g=torch.exp(g_2d), beta=beta_2d,
-                initial_state=h0,
-                output_final_state=save_state,
-                cu_seqlens=cu_seqlens,
-            )
-            if save_state:
-                core_attn_out, last_recurrent_state = result
-            else:
-                core_attn_out = result
+        # Choose kernel: skip flashinfer on Ampere OR when we are continuing
+        # a chunked prefill.  Both cases route to Triton fla_ops.
+        skip_fi = _fi.is_ampere() or _la_cont
+        core_attn_out = None
+        last_recurrent_state = None
+        if not skip_fi and _fi._USE_FLASHINFER_PREFILL:
+            try:
+                from flashinfer.gdn_prefill import chunk_gated_delta_rule as fi_chunk
+                from nanovllm.layers.fla_ops.l2norm import l2norm_fwd
+                q_normed = l2norm_fwd(query)
+                k_normed = l2norm_fwd(key)
+                T = seq_len
+                q_3d = q_normed.squeeze(0).contiguous()
+                k_3d = k_normed.squeeze(0).contiguous()
+                v_3d = value.squeeze(0).contiguous()
+                g_2d = g.squeeze(0).contiguous().float()
+                beta_2d = beta.squeeze(0).contiguous().float()
+                cu_seqlens = torch.tensor([0, T], dtype=torch.int64, device=hidden_states.device)
+                result = fi_chunk(
+                    q=q_3d, k=k_3d, v=v_3d,
+                    g=torch.exp(g_2d), beta=beta_2d,
+                    initial_state=h0,
+                    output_final_state=save_state,
+                    cu_seqlens=cu_seqlens,
+                )
+                if save_state:
+                    core_attn_out, last_recurrent_state = result
+                else:
+                    core_attn_out = result
+                    last_recurrent_state = None
+                core_attn_out = core_attn_out.unsqueeze(0)  # [1, T, H_v, V]
+            except Exception:
+                # nvcc / import failure — fall back to Triton below.
+                core_attn_out = None
                 last_recurrent_state = None
-            core_attn_out = core_attn_out.unsqueeze(0)  # [1, T, H_v, V]
 
-        except ImportError:
-            # Fallback to Triton fla_ops (may OOM on very long sequences)
+        if core_attn_out is None:
+            # Triton fla_ops path.  Handles both zero-init and continuation h0.
             from nanovllm.layers.fla_ops.chunk import chunk_gated_delta_rule as triton_chunk
             core_attn_out, last_recurrent_state = triton_chunk(
                 q=query, k=key, v=value, g=g, beta=beta,
@@ -419,11 +472,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         # Save state to buffer
         if save_state and last_recurrent_state is not None:
-            # last_recurrent_state: [1, H_v, V, K] → buf[slot]: [H_v, V, K] (same layout)
             self.recurrent_state_buf[slot_idx].copy_(
                 last_recurrent_state.squeeze(0).to(self.recurrent_state_buf.dtype)
             )
-
 
         # Norm + output projection
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)

@@ -774,21 +774,88 @@ def main():
     # --- Layer-Batch (SM-disjoint dual-stream decode) ---
     parser.add_argument("--enable-layer-batch", action="store_true",
                         help="Enable Layer-Batch parallel decode (Green Context dual-stream)")
-    parser.add_argument("--layer-batch-fa-sm", type=int, default=31,
-                        help="SMs in the FA partition (40%% of 78). LA partition = total_sm - this.")
-    parser.add_argument("--layer-batch-la-sm", type=int, default=47,
-                        help="Informational only; LA partition = total_sm - fa_sm (60%% of 78).")
+    parser.add_argument("--layer-batch-fa-sm", type=int, default=-1,
+                        help="SMs in the FA partition. -1=auto (40%% of detected total SM).")
+    parser.add_argument("--layer-batch-la-sm", type=int, default=-1,
+                        help="Informational only; LA = total_sm - fa_sm. -1=auto.")
     parser.add_argument("--layer-batch-split", type=float, default=0.5,
                         help="nano-batch1 fraction of the batch (0,1)")
     parser.add_argument("--layer-batch-min-bs", type=int, default=2,
                         help="Disable LB below this batch size")
-    parser.add_argument("--layer-batch-max-bs", type=int, default=12,
-                        help="Disable LB above this batch size (0 = no upper limit)")
+    parser.add_argument("--layer-batch-max-bs", type=int, default=-1,
+                        help="Disable LB above this batch size. -1=auto (= max-num-seqs).")
     parser.add_argument("--layer-batch-use-graph", type=int, default=1, choices=[0, 1],
-                        help="0 = eager LB (correct, default); 1 = CUDA-Graph LB (FASTER but "
-                             "produces corrupted output on ~5-10 %% of requests at high "
-                             "concurrency due to a torch.cuda.graph + ExternalStream sync bug; "
-                             "see config.py for details).")
+                        help="0 = eager LB; 1 = CUDA-Graph LB (default, verified safe after "
+                             "the 0a74ec1 fix).")
+    parser.add_argument("--layer-batch-partitions", type=str, default="",
+                        help="Dynamic SM allocation buckets, CSV of fa_sm:la_sm:max_ctx triples, "
+                             "e.g. '24:54:4096,39:39:32768,56:22:1000000'. The runtime picks the "
+                             "FIRST bucket whose max_ctx >= the current batch's max(context_lens). "
+                             "Empty (default) = use legacy single-partition mode driven by "
+                             "--layer-batch-fa-sm / --layer-batch-la-sm.")
+    parser.add_argument("--layer-batch-min-total-tokens", type=int, default=256,
+                        help="Disable LB when sum(context_lens)+bs < this. Default 256.")
+    parser.add_argument("--layer-batch-max-total-tokens", type=int, default=-1,
+                        help="Disable LB when sum(context_lens)+bs > this. -1=auto (= max_model_len * max_num_seqs).")
+    parser.add_argument("--layer-batch-no-greenctx", action="store_true",
+                        help="POD-Attention experimental: skip Green-Context partitioning and use "
+                             "two regular cuda streams that share all SMs. The grid scheduler will "
+                             "co-locate Group-A and Group-B kernels on the same SMs, mixing TC- and "
+                             "MEM-bound warps to raise SM utilization.")
+    parser.add_argument("--layer-batch-simple", action="store_true",
+                        help="Streamlined LayerBatch: exactly 2 cuda streams, no Green-Context, no "
+                             "multi-partition skeleton. Two nano-batches share all 78 SMs and the "
+                             "GPU grid scheduler co-locates their CTAs opportunistically. "
+                             "Overrides --layer-batch-no-greenctx and --layer-batch-partitions.")
+    parser.add_argument("--pod-attention-decode", action="store_true",
+                        help="POD-Attention CTA-level fusion: replace decode flash_attn with a "
+                             "Triton paged kernel that can piggy-back a GEMM at zero cost. Best at "
+                             "long ctx (>=200K total tokens). Requires LB to dispatch the GEMM.")
+    # POD kernel tile-config knobs (-1 sentinel = auto, resolved in ModelRunner)
+    parser.add_argument("--pod-num-kv-splits", type=int, default=-1,
+                        help="POD: K/V split factor (auto: pow2 scaling with max_model_len).")
+    parser.add_argument("--pod-block-n",       type=int, default=-1,
+                        help="POD: BLOCK_N attention K/V tile rows (auto: 64).")
+    parser.add_argument("--pod-block-h",       type=int, default=-1,
+                        help="POD: BLOCK_H Q-heads per CTA (auto: max(16, num_q/num_kv)).")
+    parser.add_argument("--pod-num-warps",     type=int, default=4,
+                        help="POD kernel num_warps (default 4).")
+    parser.add_argument("--pod-num-stages",    type=int, default=3,
+                        help="POD kernel num_stages (default 3).")
+    parser.add_argument("--pod-gemm-block-m",  type=int, default=16, help="POD GEMM M tile.")
+    parser.add_argument("--pod-gemm-block-n",  type=int, default=64, help="POD GEMM N tile.")
+    parser.add_argument("--pod-gemm-block-k",  type=int, default=32, help="POD GEMM K tile.")
+
+    # --- Prefill-LayerBatch (cache-hit-aware dual-stream prefill) ---
+    parser.add_argument("--enable-prefill-layer-batch", action="store_true",
+                        help="Enable Prefill LayerBatch: classify prefill seqs by prefix-cache hit, "
+                             "run high/low-hit groups in parallel on two streams under Green Context "
+                             "with asymmetric SM allocation. Designed for long-ctx + mixed-hit workloads.")
+    parser.add_argument("--prefill-lb-hit-threshold", type=float, default=0.05,
+                        help="Hit-ratio cut between low-hit and high-hit (default 0.05).")
+    parser.add_argument("--prefill-lb-min-len", type=int, default=100_000,
+                        help="Minimum prompt length (tokens) of any seq required to fire (default 100000).")
+    parser.add_argument("--prefill-lb-low-hit-sm",  type=int, default=-1,
+                        help="SMs for the LOW-hit (compute-bound) stream. -1=auto (70%% of total).")
+    parser.add_argument("--prefill-lb-high-hit-sm", type=int, default=-1,
+                        help="SMs for the HIGH-hit (bandwidth-bound) stream. -1=auto (30%% of total).")
+
+    parser.add_argument("--use-flashinfer-prefill", action="store_true",
+                        help="Use FlashInfer paged-prefill wrappers instead of flash_attn_varlen_func. "
+                             "AUTO-DISABLED on Ampere (A100, sm_80/86) to avoid Hopper-kernel JIT "
+                             "compile hazards; on Ampere the engine falls back to flash-attn 2 (if "
+                             "installed) or the pure-torch SDPA fallback.  Set env var "
+                             "NANOVLLM_FORCE_FLASHINFER_ON_AMPERE=1 to override.")
+
+    # --- Chunked prefill ---
+    parser.add_argument("--enable-chunked-prefill", action="store_true",
+                        help="Split prefill into fixed-size chunks to cap peak activation "
+                             "memory at O(chunk_size) instead of O(max_seq_len).  Only chunks "
+                             "seqs whose new-token count exceeds --prefill-chunk-size.")
+    parser.add_argument("--prefill-chunk-size", type=int, default=2048,
+                        help="Chunk size in tokens (rounded up to a multiple of "
+                             "--kvcache-block-size).  Default 2048 fits well within an A100 "
+                             "activation budget.")
 
     args = parser.parse_args()
 
@@ -817,6 +884,18 @@ def main():
         "enable_prefix_caching": args.enable_prefix_caching,
     }
     if args.enable_layer_batch:
+        # Parse --layer-batch-partitions CSV "fa:la:thr,fa:la:thr,..."
+        partitions = []
+        if args.layer_batch_partitions.strip():
+            for tri in args.layer_batch_partitions.split(","):
+                parts = tri.strip().split(":")
+                if len(parts) != 3:
+                    raise SystemExit(f"--layer-batch-partitions: bad triple {tri!r}, "
+                                      f"expected fa_sm:la_sm:max_ctx_threshold")
+                fa, la, thr = int(parts[0]), int(parts[1]), int(parts[2])
+                partitions.append((fa, la, thr))
+            partitions.sort(key=lambda t: t[2])  # ascending by max_ctx_thr
+
         engine_kwargs.update({
             "enable_layer_batch":     True,
             "layer_batch_fa_sm":      args.layer_batch_fa_sm,
@@ -825,11 +904,59 @@ def main():
             "layer_batch_min_bs":     args.layer_batch_min_bs,
             "layer_batch_max_bs":     args.layer_batch_max_bs,
             "layer_batch_use_graph":  bool(args.layer_batch_use_graph),
+            "layer_batch_min_total_tokens": args.layer_batch_min_total_tokens,
+            "layer_batch_max_total_tokens": args.layer_batch_max_total_tokens,
+            "layer_batch_no_greenctx":      bool(args.layer_batch_no_greenctx),
+            "layer_batch_simple":           bool(args.layer_batch_simple),
         })
-        logger.info("  Layer-Batch:        ENABLED  (FA SM=%d, split=%.2f, bs[%d..%d], graph=%d)",
-                    args.layer_batch_fa_sm, args.layer_batch_split,
+        if partitions:
+            engine_kwargs["layer_batch_partitions"] = partitions
+        if args.layer_batch_simple:
+            logger.info("  Layer-Batch:        ENABLED SIMPLE (2 streams, no GC, no partition)")
+        elif args.layer_batch_no_greenctx:
+            logger.info("  Layer-Batch:        ENABLED no-greenctx (2 streams sharing all SMs)")
+        elif partitions:
+            logger.info("  Layer-Batch:        ENABLED dynamic, %d partitions: %s",
+                        len(partitions), partitions)
+        else:
+            logger.info("  Layer-Batch:        ENABLED static (FA SM=%d, LA SM=%d)",
+                        args.layer_batch_fa_sm, args.layer_batch_la_sm)
+        logger.info("                      bs in [%d..%d], total_tokens in [%d..%d], graph=%d",
                     args.layer_batch_min_bs, args.layer_batch_max_bs,
+                    args.layer_batch_min_total_tokens, args.layer_batch_max_total_tokens,
                     args.layer_batch_use_graph)
+
+    if args.pod_attention_decode:
+        engine_kwargs["pod_attention_decode"] = True
+        engine_kwargs["pod_num_kv_splits"]   = int(args.pod_num_kv_splits)
+        engine_kwargs["pod_block_n"]         = int(args.pod_block_n)
+        engine_kwargs["pod_block_h"]         = int(args.pod_block_h)
+        engine_kwargs["pod_num_warps"]       = int(args.pod_num_warps)
+        engine_kwargs["pod_num_stages"]      = int(args.pod_num_stages)
+        engine_kwargs["pod_gemm_block_m"]    = int(args.pod_gemm_block_m)
+        engine_kwargs["pod_gemm_block_n"]    = int(args.pod_gemm_block_n)
+        engine_kwargs["pod_gemm_block_k"]    = int(args.pod_gemm_block_k)
+        logger.info("  POD-decode:         ENABLED (Triton paged flash_attn + GEMM piggy-back) "
+                    "kv_splits=%s block_n=%s block_h=%s warps=%s stages=%s",
+                    args.pod_num_kv_splits, args.pod_block_n, args.pod_block_h,
+                    args.pod_num_warps, args.pod_num_stages)
+
+    if args.enable_prefill_layer_batch:
+        engine_kwargs["enable_prefill_layer_batch"] = True
+        engine_kwargs["prefill_lb_hit_threshold"]  = float(args.prefill_lb_hit_threshold)
+        engine_kwargs["prefill_lb_min_len"]        = int(args.prefill_lb_min_len)
+        engine_kwargs["prefill_lb_low_hit_sm"]     = int(args.prefill_lb_low_hit_sm)
+        engine_kwargs["prefill_lb_high_hit_sm"]    = int(args.prefill_lb_high_hit_sm)
+    if args.use_flashinfer_prefill:
+        engine_kwargs["use_flashinfer_prefill"] = True
+        logger.info("  FlashInfer paged-prefill: requested (Ampere hosts auto-disable this)")
+    if args.enable_chunked_prefill:
+        engine_kwargs["enable_chunked_prefill"] = True
+        engine_kwargs["prefill_chunk_size"] = int(args.prefill_chunk_size)
+        logger.info("  Chunked prefill: ENABLED (chunk_size=%d)", args.prefill_chunk_size)
+        logger.info("  Prefill-LB:         ENABLED (hit_thr=%.2f min_len=%d low_sm=%s high_sm=%s)",
+                    args.prefill_lb_hit_threshold, args.prefill_lb_min_len,
+                    args.prefill_lb_low_hit_sm, args.prefill_lb_high_hit_sm)
 
     engine = AsyncEngineWrapper(args.model, served_model_name=args.served_model_name, **engine_kwargs)
 

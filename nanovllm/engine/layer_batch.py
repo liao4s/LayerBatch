@@ -182,18 +182,16 @@ def run_layer_batch_decode(
                 stream.wait_stream(last_stream_A)
                 # Tell the caching allocator that hA / rA — created on the
                 # previous unit's stream — are now consumed on `stream`.
-                # Without this, the allocator can free the underlying memory
-                # the moment last_stream_A's last kernel finishes and recycle
-                # it for a fresh allocation on fa_stream BEFORE the new
-                # kernel here actually reads it (race that the captured
-                # graph then preserves into a nondeterministic replay).
+                # See precision-fix README for why this record_stream is needed.
                 hA.record_stream(stream)
                 if rA is not None:
                     rA.record_stream(stream)
             _set_ctx(ctxA)
             with torch.cuda.stream(stream):
+                torch.cuda.nvtx.range_push(f"LB-A-t{t}-{kind}")
                 for li in layer_ids:
                     hA, rA = layers[li](posA, hA, rA)
+                torch.cuda.nvtx.range_pop()
             last_stream_A = stream
 
         # ---- Group-B: unit (t-1) ----
@@ -208,8 +206,10 @@ def run_layer_batch_decode(
                     rB.record_stream(stream)
             _set_ctx(ctxB)
             with torch.cuda.stream(stream):
+                torch.cuda.nvtx.range_push(f"LB-B-t{t-1}-{kind}")
                 for li in layer_ids:
                     hB, rB = layers[li](posB, hB, rB)
+                torch.cuda.nvtx.range_pop()
             last_stream_B = stream
 
     # ---- phase 3: drain both groups back to anchor → final residual + RMSNorm ----

@@ -1,6 +1,6 @@
 import os
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from transformers import AutoConfig
 
 
@@ -196,10 +196,11 @@ class Config:
     # SM count for the FA partition. The remaining SMs go to the LA partition.
     # Driver may round to alignment; values are clamped to [8, total_sms-8].
     # Pipeline LB design: LA-block stream runs 3 LA layers; FA-layer stream runs 1 FA layer.
-    # LA is the compute-heavier path → give it more SMs.  Defaults target H20 78 SMs:
-    #   FA partition  31 SMs ≈ 40 %      LA partition (remainder)  47 SMs ≈ 60 %
-    layer_batch_fa_sm: int = 31
-    layer_batch_la_sm: int = 47       # informational; LA uses remainder = total - fa_sm
+    # LA is the compute-heavier path → give it more SMs.
+    # Defaults: -1 means auto = round(total_sm * 0.4) for fa, total_sm - fa for la.
+    # The auto-resolution happens at ModelRunner init (after CUDA device set).
+    layer_batch_fa_sm: int = -1
+    layer_batch_la_sm: int = -1       # informational; LA uses remainder = total - fa_sm
     # Fraction in (0, 1): nano_batch1 size = ceil(bs * split). 0.5 = even split.
     layer_batch_split: float = 0.5
     # Disable layer-batch when batch size is below this threshold.
@@ -209,7 +210,7 @@ class Config:
     # actually slows decode down (each half loses BW vs the un-split full kernel).
     # Empirically (Qwen3.5-2B / H20-78SM): LB wins at bs≈4-10, neutral at bs<=4,
     # and hurts at bs>=16; pick a cutoff in [12, 14].
-    layer_batch_max_bs: int = 12
+    layer_batch_max_bs: int = -1     # -1 = auto: max_num_seqs (no upper limit)
     # Enable CUDA Graph capture for the LB path. True is now safe.
     #
     # NOTE: previous versions defaulted to False because the LB+graph
@@ -233,6 +234,114 @@ class Config:
     #      use by any real request this step.
     # All three are fixed.  Verified 0/64 garble at c=16, 0/96 at c=32.
     layer_batch_use_graph: bool = True
+
+    # ---- Dynamic SM allocation (multiple Green-Context partitions) ----
+    # List of (fa_sm, la_sm, max_ctx_threshold).  At each decode step the
+    # runner picks the FIRST partition whose `max_ctx_threshold` >= the
+    # batch's max(context_lens); if none match, the last partition is used.
+    #
+    # Empty list ([]) → falls back to single-partition mode using
+    # `layer_batch_fa_sm` / `layer_batch_la_sm` above (legacy behaviour).
+    #
+    # Default 3-bucket policy targets H20-78SM + Qwen3.5-2B:
+    #   short ctx (≤4K)    : LA gets large partition (LA's 18 GEMMs dominate)
+    #   medium  (≤32K)     : balanced
+    #   long ctx (rest)    : FA gets large partition (flash_attn dominates)
+    # Default empty: auto-fill at init based on total_sm + max_model_len if user
+    # enables layer-batch AND does not pick simple / no-greenctx variants.
+    # Auto policy (3-bucket, total_sm-aware):
+    #   short ctx ≤ 4K        : LA gets ~70%   (LA's many GEMMs dominate)
+    #   medium  ≤ floor(max_model_len/2) : balanced 50/50
+    #   long ctx (rest)        : FA gets ~70%  (flash_attn dominates)
+    layer_batch_partitions: list = field(default_factory=list)
+
+    # ---- Total-token enable/disable thresholds ----
+    # `total_tokens` = sum(context_lens) + bs (tokens being read+written this step).
+    # LB only fires when `total_tokens` is in [min, max] AND bs is in [min_bs, max_bs].
+    # min: below this the per-step work is too small for split-SM to pay off.
+    # max: above this HBM is saturated and partitioning hurts (PD-Mux observation).
+    layer_batch_min_total_tokens: int = 256
+    layer_batch_max_total_tokens: int = -1   # -1 = auto = max_model_len * max_num_seqs
+
+    # ---- POD-Attention experimental modes ----
+    # `no_greenctx`: skip CUDA Green-Context partitioning and instead create
+    # two regular `torch.cuda.Stream()` instances that BOTH share all 78 SMs.
+    # The grid scheduler will co-locate kernels from both streams onto the
+    # same SMs, so a TC-bound GEMM warp and a memory-bound recurrent warp
+    # can cohabitate one SM — exactly the POD-Attention idea, but at the
+    # stream-level granularity (instead of CTA-level fusion).
+    layer_batch_no_greenctx: bool = False
+
+    # Streamlined LayerBatch: exactly 2 cuda streams, no Green-Context, no
+    # multi-partition skeleton.  Two nano-batches share all SMs; the GPU grid
+    # scheduler co-locates LA-on-stream-A's and FA-on-stream-B's CTAs only when
+    # there are spare SMs (purely opportunistic — no hardware partitioning).
+    # Mutually exclusive with layer_batch_no_greenctx and layer_batch_partitions
+    # (when set, those two are ignored).
+    layer_batch_simple: bool = False
+
+    # POD-Attention CTA-fused decode kernel (paged flash-attn + optional GEMM
+    # piggy-back).  When True, FA layers' decode flash_attn calls go through
+    # the Triton kernel in `nanovllm.layers.pod_kernels` instead of the
+    # external flash-attn library.
+    pod_attention_decode: bool = False
+
+    # ---- Prefill-LayerBatch (cache-hit-aware dual-stream prefill) ----
+    # Motivation: at very long contexts (>100K) with high prefix-cache hit
+    # ratio, prefill becomes HBM-bandwidth bound (loading large KV cache).
+    # Conversely, low-hit prefill is compute-bound (QKV proj + MLP on many
+    # new tokens). Splitting these into two groups and running them on two
+    # CUDA streams (under Green Context with asymmetric SM allocation) may
+    # let the compute-bound group's GEMMs and the bandwidth-bound group's
+    # KV reads overlap on the same SM (analogous to POD-Attention's idea
+    # but at the prefill batch level).
+    enable_prefill_layer_batch: bool = False
+    # Hit-ratio threshold to classify a sequence as "high-hit" vs "low-hit".
+    # Default 0.05: any sequence with >5% of its tokens already cached is
+    # treated as high-hit; <5% goes to low-hit. The split fires only when
+    # both groups are non-empty AND at least one sequence has length >= min_len.
+    prefill_lb_hit_threshold: float = 0.05
+    # Minimum sequence length (in tokens) of at least one seq in the batch
+    # for the split to fire. Below this the prefill is small enough that
+    # parallel-stream overhead exceeds the gain.
+    prefill_lb_min_len: int = 100_000
+    # SM allocation for the Green Context partition used by prefill split.
+    # -1 sentinels: low_hit_sm = round(total_sm * 0.7) (compute-bound path
+    # gets more SMs); high_hit_sm = total_sm - low_hit_sm.
+    prefill_lb_low_hit_sm: int = -1
+    prefill_lb_high_hit_sm: int = -1
+
+    # ---- POD-Attention Triton kernel tile configuration ----
+    # All -1 sentinel values are auto-resolved by ModelRunner._resolve_pod_config()
+    # using head_dim, num_kv_heads, page_size, and max_model_len.
+    pod_num_kv_splits: int = -1   # default auto: clamp(max_model_len // 8192, 4, 32) rounded up to power of 2
+    pod_block_n:       int = -1   # default auto: 64 (matches Hopper L1 line, decode-tuned)
+    pod_block_h:       int = -1   # default auto: max(16, num_q_heads_per_kv) — must be >= H_q/H_kv
+    pod_num_warps:     int = 4    # constant: 4 warps balances reg pressure + occupancy
+    pod_num_stages:    int = 3    # constant: 3 stages for software-pipelined K/V loads
+    pod_gemm_block_m:  int = 16   # GEMM M-tile (decode: M is small, 1..8 typical)
+    pod_gemm_block_n:  int = 64   # GEMM N-tile
+    pod_gemm_block_k:  int = 32   # GEMM K-tile
+
+    # ---- FlashInfer paged-prefill backend (Ampere-aware) ----
+    # Enables FlashInfer's BatchPrefillWithPagedKVCacheWrapper for prefill
+    # attention.  Auto-detected off on Ampere (A100, sm_80/86) — flashinfer
+    # JIT hazards make it unreliable there.  Users can force it on Ampere
+    # via the environment variable NANOVLLM_FORCE_FLASHINFER_ON_AMPERE=1
+    # (only recommended if they installed flashinfer-cubin so JIT is off).
+    use_flashinfer_prefill: bool = False
+
+    # ---- Chunked prefill ----
+    # Splits each seq's prefill work into fixed-size token chunks, running
+    # them sequentially through the model to cap peak activation memory at
+    # O(chunk_size) instead of O(max_seq_len).  Chunks are aligned to
+    # `kvcache_block_size` for cache consistency; the effective chunk size
+    # is `ceil(prefill_chunk_size / kvcache_block_size) * kvcache_block_size`.
+    # Enable when your prompts approach the max_model_len and your GPU is
+    # small (e.g. A100-40GB) — for shorter prompts the extra Python-loop
+    # overhead outweighs the memory win.
+    enable_chunked_prefill: bool = False
+    prefill_chunk_size: int = 2048
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
