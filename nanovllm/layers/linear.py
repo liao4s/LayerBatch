@@ -147,7 +147,13 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
+            # Compute matmul + all_reduce in float32 to prevent precision loss
+            # that compounds through recurrent linear attention layers
+            orig_dtype = x.dtype
+            y = F.linear(x.float(), self.weight.float(),
+                         self.bias.float() if (self.bias is not None and self.tp_rank == 0) else None)
             dist.all_reduce(y)
-        return y
+            return y.to(orig_dtype)
+        else:
+            return F.linear(x, self.weight, self.bias)
