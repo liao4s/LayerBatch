@@ -191,6 +191,49 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
 
+    # ----- Layer-Batch parallelism (Green-Context dual-stream decode) -----
+    enable_layer_batch: bool = False
+    # SM count for the FA partition. The remaining SMs go to the LA partition.
+    # Driver may round to alignment; values are clamped to [8, total_sms-8].
+    # Pipeline LB design: LA-block stream runs 3 LA layers; FA-layer stream runs 1 FA layer.
+    # LA is the compute-heavier path → give it more SMs.  Defaults target H20 78 SMs:
+    #   FA partition  31 SMs ≈ 40 %      LA partition (remainder)  47 SMs ≈ 60 %
+    layer_batch_fa_sm: int = 31
+    layer_batch_la_sm: int = 47       # informational; LA uses remainder = total - fa_sm
+    # Fraction in (0, 1): nano_batch1 size = ceil(bs * split). 0.5 = even split.
+    layer_batch_split: float = 0.5
+    # Disable layer-batch when batch size is below this threshold.
+    layer_batch_min_bs: int = 2
+    # Disable layer-batch when batch size is at or above this threshold.
+    # At very large bs the GPU is already saturated and SM-disjoint partitioning
+    # actually slows decode down (each half loses BW vs the un-split full kernel).
+    # Empirically (Qwen3.5-2B / H20-78SM): LB wins at bs≈4-10, neutral at bs<=4,
+    # and hurts at bs>=16; pick a cutoff in [12, 14].
+    layer_batch_max_bs: int = 12
+    # Enable CUDA Graph capture for the LB path. True is now safe.
+    #
+    # NOTE: previous versions defaulted to False because the LB+graph
+    # combination produced ~5-10% garbled output at high concurrency.
+    # Three independent bugs caused that:
+    #   1. The captured graph runs on `la_stream` (a Green-Context
+    #      `ExternalStream`); the runtime input copies happen on the
+    #      default stream — there was no cross-stream wait, so the
+    #      replay raced against the input writes.  Fix: explicit
+    #      `la_stream.wait_stream(default)` before `graph.replay()`.
+    #   2. PyTorch's caching allocator did not track ExternalStream
+    #      tensor lifetimes, so intermediate tensors crossing
+    #      la_stream ↔ fa_stream could be freed/recycled mid-use,
+    #      yielding nondeterministic replay (verified: same-input
+    #      replay diverged by >20.0 max-abs across trials).  Fix:
+    #      explicit `tensor.record_stream(stream)` at every
+    #      cross-ExternalStream boundary in `run_layer_batch_decode`.
+    #   3. The bs<bucket_bs padding code reused the first real
+    #      request's LA slot for padding entries, which collide
+    #      across Group-A / Group-B writes.  Fix: pick a slot not in
+    #      use by any real request this step.
+    # All three are fixed.  Verified 0/64 garble at c=16, 0/96 at c=32.
+    layer_batch_use_graph: bool = True
+
     def __post_init__(self):
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0

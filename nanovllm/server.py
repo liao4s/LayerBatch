@@ -33,6 +33,17 @@ from pydantic import BaseModel, Field
 
 from nanovllm.engine.llm_engine import LLMEngine
 from nanovllm.sampling_params import SamplingParams
+
+def _resolve_ignore_eos(request) -> bool:
+    """Resolve ignore_eos from OpenAI-compatible body. Supports top-level
+    `ignore_eos` and `nvext.ignore_eos` (Triton NIM convention). Returns False
+    when neither is specified."""
+    val = getattr(request, "ignore_eos", None)
+    if val is None:
+        nvext = getattr(request, "nvext", None) or {}
+        val = nvext.get("ignore_eos") if isinstance(nvext, dict) else None
+    return bool(val) if val is not None else False
+
 from nanovllm.utils.logger import init_logger
 
 logger = init_logger(__name__)
@@ -56,6 +67,8 @@ class ChatCompletionRequest(BaseModel):
     n: int = 1
     stop: Optional[Union[List[str], str]] = None
     chat_template_kwargs: Optional[dict] = None
+    ignore_eos: Optional[bool] = None
+    nvext: Optional[dict] = None
 
 class CompletionRequest(BaseModel):
     model: str = ""
@@ -66,6 +79,8 @@ class CompletionRequest(BaseModel):
     top_p: float = 1.0
     n: int = 1
     stop: Optional[Union[List[str], str]] = None
+    ignore_eos: Optional[bool] = None
+    nvext: Optional[dict] = None
 
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
@@ -142,6 +157,8 @@ class PendingRequest:
     # For streaming: tokens pushed here incrementally
     token_queue: Optional[asyncio.Queue] = None
     stream: bool = False
+    # Final completion_tokens count (set by worker just before sentinel)
+    completion_tokens_final: int = 0
 
 
 # ============================================================
@@ -160,8 +177,13 @@ class AsyncEngineWrapper:
         self._pending: dict[int, PendingRequest] = {}
         self._lock = threading.Lock()
 
-        # Track token counts for streaming incremental decode
+        # Track token counts for streaming incremental decode.
+        # _seq_prev_text holds the text we have ALREADY emitted to the client;
+        # used to compute incremental diffs when re-decoding the cumulative
+        # token sequence (which is the only way to handle multi-byte UTF-8
+        # tokens correctly — see _stable_decoded_text below).
         self._seq_prev_tokens: dict[int, int] = {}
+        self._seq_prev_text: dict[int, str] = {}
 
         # Background engine loop
         self._running = True
@@ -332,13 +354,28 @@ class AsyncEngineWrapper:
                     cur_count = seq.num_completion_tokens
                     prev_count = self._seq_prev_tokens.get(sid, 0)
                     if cur_count > prev_count:
-                        new_ids = seq.completion_token_ids[prev_count:cur_count]
-                        self._seq_prev_tokens[sid] = cur_count
-                        text = self.tokenizer.decode(new_ids, skip_special_tokens=True)
-                        if text:
+                        # CRITICAL: do NOT decode just the new tokens. A multi-
+                        # byte UTF-8 character (CJK, emoji) can span two or more
+                        # tokens whose bytes split the codepoint; decoding such
+                        # a partial token alone yields U+FFFD ('\uFFFD'). The
+                        # only correct streaming protocol is cumulative decode +
+                        # incremental diff, deferring any trailing replacement
+                        # chars (incomplete prefix) until later tokens complete
+                        # the codepoint.
+                        all_ids = seq.completion_token_ids[:cur_count]
+                        full_text = self.tokenizer.decode(
+                            all_ids, skip_special_tokens=True)
+                        # Strip trailing U+FFFD (incomplete UTF-8 char) — those
+                        # bytes will resolve once more tokens arrive.
+                        stable = full_text.rstrip("\uFFFD")
+                        prev_emitted = self._seq_prev_text.get(sid, "")
+                        if len(stable) > len(prev_emitted):
+                            new_chunk = stable[len(prev_emitted):]
+                            self._seq_prev_text[sid] = stable
                             pending.loop.call_soon_threadsafe(
-                                pending.token_queue.put_nowait, text
-                            )
+                                pending.token_queue.put_nowait, new_chunk)
+                        # Update token count even if no text was emitted.
+                        self._seq_prev_tokens[sid] = cur_count
 
             # Process completed sequences
             for seq_id, token_ids in outputs:
@@ -357,8 +394,19 @@ class AsyncEngineWrapper:
                 }
 
                 if pending.stream:
-                    # Push remaining tokens + sentinel
-                    prev_count = 0  # already pushed incrementally
+                    # Push final text remainder (anything between the last
+                    # streamed `stable` text and the full decoded text). At
+                    # finish time there are no more tokens to come, so we MUST
+                    # emit any deferred trailing bytes — including any final
+                    # U+FFFD that would otherwise be silently dropped.
+                    prev_emitted = self._seq_prev_text.get(seq_id, "")
+                    if len(text) > len(prev_emitted):
+                        tail = text[len(prev_emitted):]
+                        pending.loop.call_soon_threadsafe(
+                            pending.token_queue.put_nowait, tail)
+                    self._seq_prev_text.pop(seq_id, None)
+                    # Push remaining tokens + sentinel; record final usage
+                    pending.completion_tokens_final = len(token_ids)
                     pending.loop.call_soon_threadsafe(
                         pending.token_queue.put_nowait, None  # sentinel
                     )
@@ -438,6 +486,7 @@ def create_app(engine: AsyncEngineWrapper, shutdown_event: asyncio.Event | None 
         sampling_params = SamplingParams(
             temperature=max(request.temperature, 0.01),
             max_tokens=request.max_tokens,
+            ignore_eos=_resolve_ignore_eos(request),
         )
 
         try:
@@ -523,6 +572,20 @@ def create_app(engine: AsyncEngineWrapper, shutdown_event: asyncio.Event | None 
             ],
         )
         yield f"data: {chunk.model_dump_json()}\n\n"
+        # Usage chunk (always emit; see completion path).
+        usage_chunk = {
+            "id": request_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_name,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": pending.prompt_tokens,
+                "completion_tokens": pending.completion_tokens_final,
+                "total_tokens": pending.prompt_tokens + pending.completion_tokens_final,
+            },
+        }
+        yield f"data: {json.dumps(usage_chunk)}\n\n"
         yield "data: [DONE]\n\n"
 
     # ----------------------------------------------------------
@@ -537,6 +600,7 @@ def create_app(engine: AsyncEngineWrapper, shutdown_event: asyncio.Event | None 
         sampling_params = SamplingParams(
             temperature=max(request.temperature, 0.01),
             max_tokens=request.max_tokens,
+            ignore_eos=_resolve_ignore_eos(request),
         )
 
         try:
@@ -590,7 +654,7 @@ def create_app(engine: AsyncEngineWrapper, shutdown_event: asyncio.Event | None 
             )
             yield f"data: {chunk.model_dump_json()}\n\n"
 
-        # Final chunk
+        # Final chunk with finish_reason
         chunk = CompletionStreamResponse(
             id=request_id,
             created=created,
@@ -600,6 +664,22 @@ def create_app(engine: AsyncEngineWrapper, shutdown_event: asyncio.Event | None 
             ],
         )
         yield f"data: {chunk.model_dump_json()}\n\n"
+        # Usage chunk (OpenAI stream_options.include_usage convention).
+        # Always emit so clients counting via usage get accurate counts even
+        # when the client did not opt in to stream_options — bench_water needs this.
+        usage_chunk = {
+            "id": request_id,
+            "object": "text_completion.chunk",
+            "created": created,
+            "model": model_name,
+            "choices": [],
+            "usage": {
+                "prompt_tokens": pending.prompt_tokens,
+                "completion_tokens": pending.completion_tokens_final,
+                "total_tokens": pending.prompt_tokens + pending.completion_tokens_final,
+            },
+        }
+        yield f"data: {json.dumps(usage_chunk)}\n\n"
         yield "data: [DONE]\n\n"
 
     return app
@@ -691,6 +771,25 @@ def main():
     parser.add_argument("--served-model-name", type=str, default=None,
                         help="Custom model name for API responses. If not set, uses the model directory name")
 
+    # --- Layer-Batch (SM-disjoint dual-stream decode) ---
+    parser.add_argument("--enable-layer-batch", action="store_true",
+                        help="Enable Layer-Batch parallel decode (Green Context dual-stream)")
+    parser.add_argument("--layer-batch-fa-sm", type=int, default=31,
+                        help="SMs in the FA partition (40%% of 78). LA partition = total_sm - this.")
+    parser.add_argument("--layer-batch-la-sm", type=int, default=47,
+                        help="Informational only; LA partition = total_sm - fa_sm (60%% of 78).")
+    parser.add_argument("--layer-batch-split", type=float, default=0.5,
+                        help="nano-batch1 fraction of the batch (0,1)")
+    parser.add_argument("--layer-batch-min-bs", type=int, default=2,
+                        help="Disable LB below this batch size")
+    parser.add_argument("--layer-batch-max-bs", type=int, default=12,
+                        help="Disable LB above this batch size (0 = no upper limit)")
+    parser.add_argument("--layer-batch-use-graph", type=int, default=1, choices=[0, 1],
+                        help="0 = eager LB (correct, default); 1 = CUDA-Graph LB (FASTER but "
+                             "produces corrupted output on ~5-10 %% of requests at high "
+                             "concurrency due to a torch.cuda.graph + ExternalStream sync bug; "
+                             "see config.py for details).")
+
     args = parser.parse_args()
 
     logger.info("Starting nanovllm API server...")
@@ -717,6 +816,20 @@ def main():
         "kvcache_block_size": args.kvcache_block_size,
         "enable_prefix_caching": args.enable_prefix_caching,
     }
+    if args.enable_layer_batch:
+        engine_kwargs.update({
+            "enable_layer_batch":     True,
+            "layer_batch_fa_sm":      args.layer_batch_fa_sm,
+            "layer_batch_la_sm":      args.layer_batch_la_sm,
+            "layer_batch_split":      args.layer_batch_split,
+            "layer_batch_min_bs":     args.layer_batch_min_bs,
+            "layer_batch_max_bs":     args.layer_batch_max_bs,
+            "layer_batch_use_graph":  bool(args.layer_batch_use_graph),
+        })
+        logger.info("  Layer-Batch:        ENABLED  (FA SM=%d, split=%.2f, bs[%d..%d], graph=%d)",
+                    args.layer_batch_fa_sm, args.layer_batch_split,
+                    args.layer_batch_min_bs, args.layer_batch_max_bs,
+                    args.layer_batch_use_graph)
 
     engine = AsyncEngineWrapper(args.model, served_model_name=args.served_model_name, **engine_kwargs)
 

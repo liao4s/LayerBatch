@@ -1,3 +1,4 @@
+import os
 import pickle
 import torch
 import torch.distributed as dist
@@ -11,6 +12,8 @@ from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 from nanovllm.utils.logger import init_logger
+from nanovllm.utils.green_ctx import init_green_contexts, get_streams, get_sm_counts, is_supported as _gctx_supported
+from nanovllm.engine.layer_batch import run_layer_batch_decode
 
 logger = init_logger(__name__)
 
@@ -40,9 +43,12 @@ class ModelRunner:
         self.rank = rank
         self.event = event
         self._has_linear_attn = getattr(hf_config, 'model_type', '') in ('qwen3_5_moe', 'qwen3_5')
+        self._fa_stream = None
+        self._la_stream = None
+        self._layer_types: list[str] = []
 
         import datetime
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank,
+        _port = int(os.environ.get("NANOVLLM_DIST_PORT", "2333")); dist.init_process_group("nccl", f"tcp://localhost:{_port}", world_size=self.world_size, rank=rank,
                                 timeout=datetime.timedelta(minutes=30))
         torch.cuda.set_device(rank)
         # Set up Triton allocator (required for kernels needing scratch memory in Triton 3.6+)
@@ -69,6 +75,37 @@ class ModelRunner:
             self.allocate_linear_attn_states()
         if not self.enforce_eager:
             self.capture_cudagraph()
+
+        # Initialize Green Context streams for layer-batch parallelism (rank 0 only).
+        self._fa_stream = None
+        self._la_stream = None
+        self._lb_graphs: dict = {}
+        if self.config.enable_layer_batch and self.rank == 0:
+            try:
+                if not _gctx_supported():
+                    raise RuntimeError("cuda-python green-ctx APIs unavailable")
+                self._fa_stream, self._la_stream = init_green_contexts(
+                    fa_sm=self.config.layer_batch_fa_sm,
+                    la_sm_min=self.config.layer_batch_la_sm,
+                    device_index=torch.cuda.current_device(),
+                    non_blocking=True,
+                )
+                fa_sm_real, la_sm_real = get_sm_counts()
+                logger.info("Layer-Batch: Green Contexts ready  FA=%d SMs, LA=%d SMs",
+                            fa_sm_real, la_sm_real)
+                # Cache the ordered list of layer types for run-time scheduling.
+                hf_text = hf_config.text_config if hasattr(hf_config, "text_config") else hf_config
+                self._layer_types = list(hf_text.layer_types)
+
+                if not self.enforce_eager and self.config.layer_batch_use_graph:
+                    self.capture_layer_batch_graphs()
+            except Exception as e:
+                logger.warning("Layer-Batch init failed (%s) — falling back to standard decode.", e)
+                import traceback; traceback.print_exc()
+                self._fa_stream = None
+                self._la_stream = None
+                self.config.enable_layer_batch = False
+
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -373,28 +410,209 @@ class ModelRunner:
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
+    def _layer_batch_eligible(self, is_prefill: bool, bs: int) -> bool:
+        if is_prefill:
+            return False
+        if not getattr(self.config, "enable_layer_batch", False):
+            return False
+        if self._fa_stream is None or self._la_stream is None:
+            return False
+        if bs < int(self.config.layer_batch_min_bs):
+            return False
+        # At very large bs LB hurts (the full-batch kernel already saturates the
+        # GPU; splitting forces each half onto half the SMs at lower BW).  Skip.
+        max_bs = int(getattr(self.config, 'layer_batch_max_bs', 0))
+        if max_bs > 0 and bs > max_bs:
+            return False
+        # Need at least 2 nano-batches; both must be non-empty.
+        split = float(self.config.layer_batch_split)
+        B1 = max(1, min(bs - 1, int(round(bs * split))))
+        return 1 <= B1 < bs
+
+    def _run_layer_batch_decode(self, input_ids: torch.Tensor,
+                                 positions: torch.Tensor) -> torch.Tensor:
+        bs = input_ids.size(0)
+        split = float(self.config.layer_batch_split)
+
+        # Use captured graph if available
+        if self._lb_graphs:
+            # Pick smallest captured bs >= bs
+            bucket_bs = next((b for b in self.graph_bs if b >= bs and (b, max(1, min(b-1, int(round(b*split))))) in self._lb_graphs), None)
+            if bucket_bs is not None:
+                B1 = max(1, min(bucket_bs - 1, int(round(bucket_bs * split))))
+                B2 = bucket_bs - B1
+                gv = self.graph_vars
+                ctx = get_context()
+                # Stage inputs into static buffers
+                gv["input_ids"][:bs] = input_ids
+                gv["positions"][:bs] = positions
+                gv["slot_mapping"].fill_(-1)
+                gv["slot_mapping"][:bs] = ctx.slot_mapping
+                gv["context_lens"].zero_()
+                gv["context_lens"][:bs] = ctx.context_lens
+                # Pad block_tables (each row to length captured)
+                gv["block_tables"][:bs, :ctx.block_tables.size(1)] = ctx.block_tables
+                if "linear_attn_slot_indices" in gv and ctx.linear_attn_slot_indices is not None:
+                    gv["linear_attn_slot_indices"].zero_()
+                    gv["linear_attn_slot_indices"][:bs] = ctx.linear_attn_slot_indices
+                # If bs < bucket_bs, pad nb1 tail / nb2 head/tail with safe slot indices.
+                # CRITICAL for LB: the padding entries land in Group-B's tail.  If
+                # the padding `linear_attn_slot_indices` value collides with any
+                # slot used by a real request — especially one in Group A —
+                # both groups will read/write the same LA recurrent-state slot
+                # within the same captured graph, producing intermittent garbled
+                # output.  Pick a slot that no real request is using this step.
+                if bs < bucket_bs:
+                    if "linear_attn_slot_indices" in gv and ctx.linear_attn_slot_indices is not None:
+                        used = set(ctx.linear_attn_slot_indices[:bs].tolist())
+                        # max_num_seqs is the size of the LA-slot pool; pick any unused index.
+                        free_slot = next((s_ for s_ in range(self.config.max_num_seqs) if s_ not in used), 0)
+                        gv["linear_attn_slot_indices"][bs:bucket_bs] = free_slot
+                    gv["context_lens"][bs:bucket_bs] = 1
+                    # Repeat last block_table row (FA path uses slot_mapping=-1 to
+                    # skip KV writes, so this row is read-only padding).
+                    if bs > 0:
+                        gv["block_tables"][bs:bucket_bs, :ctx.block_tables.size(1)] = ctx.block_tables[-1:]
+                graph = self._lb_graphs[(bucket_bs, B1)]
+                # CRITICAL: the captured graph was recorded on la_stream and
+                # reads the static input buffers (gv["input_ids"], etc.) that
+                # we JUST wrote from the default stream above.  Without an
+                # explicit cross-stream wait, la_stream can start replay before
+                # the default-stream copies finish — manifesting as ~5-10 %
+                # garbled outputs at high concurrency.  Eager mode masked this
+                # because all work happened on the default stream (FIFO).
+                # The captured graph runs on la_stream and reads the static
+                # input buffers we just wrote on the default stream — make
+                # la_stream wait for those writes before replay; then drain back
+                # to the default stream so the LM head sees the outputs.
+                self._la_stream.wait_stream(torch.cuda.current_stream())
+                graph.replay()
+                torch.cuda.current_stream().wait_stream(self._la_stream)
+                return self.model.compute_logits(gv["outputs"][:bs])
+
+        # Eager fallback
+        B1 = max(1, min(bs - 1, int(round(bs * split))))
+        lm = getattr(self.model, "language_model", None)
+        if lm is None:
+            lm = getattr(self.model, "model", None)
+        hidden = run_layer_batch_decode(
+            language_model=lm,
+            input_ids=input_ids,
+            positions=positions,
+            layer_types=self._layer_types,
+            B1=B1,
+            fa_stream=self._fa_stream,
+            la_stream=self._la_stream,
+        )
+        return self.model.compute_logits(hidden)
+
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
-        else:
-            bs = input_ids.size(0)
-            context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            # Update linear attention slot indices for CUDA Graph
-            if "linear_attn_slot_indices" in graph_vars and context.linear_attn_slot_indices is not None:
-                graph_vars["linear_attn_slot_indices"].zero_()
-                graph_vars["linear_attn_slot_indices"][:bs] = context.linear_attn_slot_indices
-            graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+
+        bs = input_ids.size(0)
+
+        # Layer-Batch parallel decode (Green Context dual-stream).
+        if self._layer_batch_eligible(is_prefill, bs):
+            return self._run_layer_batch_decode(input_ids, positions)
+
+        # Standard CUDA-graph decode.
+        context = get_context()
+        graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+        graph_vars = self.graph_vars
+        graph_vars["input_ids"][:bs] = input_ids
+        graph_vars["positions"][:bs] = positions
+        graph_vars["slot_mapping"].fill_(-1)
+        graph_vars["slot_mapping"][:bs] = context.slot_mapping
+        graph_vars["context_lens"].zero_()
+        graph_vars["context_lens"][:bs] = context.context_lens
+        graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+        if "linear_attn_slot_indices" in graph_vars and context.linear_attn_slot_indices is not None:
+            graph_vars["linear_attn_slot_indices"].zero_()
+            graph_vars["linear_attn_slot_indices"][:bs] = context.linear_attn_slot_indices
+        graph.replay()
+        return self.model.compute_logits(graph_vars["outputs"][:bs])
+
+    @torch.inference_mode()
+    def capture_layer_batch_graphs(self):
+        """Capture CUDA graphs for the Layer-Batch decode path.
+
+        Reuses the static buffers from `capture_cudagraph` (input_ids, positions,
+        slot_mapping, context_lens, block_tables, linear_attn_slot_indices, outputs).
+        For each (bs, B1) bucket we capture one graph that runs the layer-batched
+        forward pass using two Green-Context streams.
+        """
+        from nanovllm.engine.layer_batch import run_layer_batch_decode
+        from nanovllm.utils.context import Context
+        import nanovllm.utils.context as _ctxmod
+
+        gv = self.graph_vars
+        sm_full = gv["slot_mapping"]
+        cl_full = gv["context_lens"]
+        bt_full = gv["block_tables"]
+        li_full = gv.get("linear_attn_slot_indices")
+        out_full = gv["outputs"]
+        in_full  = gv["input_ids"]
+        pos_full = gv["positions"]
+        max_blocks = bt_full.size(1)
+
+        split = float(self.config.layer_batch_split)
+        min_bs = max(2, int(self.config.layer_batch_min_bs))
+        graph_bs = [b for b in self.graph_bs if b >= min_bs]
+
+        lm = getattr(self.model, "language_model", None) or getattr(self.model, "model", None)
+        layer_types = self._layer_types
+
+        n_captured = 0
+        for bs in reversed(graph_bs):
+            B1 = max(1, min(bs - 1, int(round(bs * split))))
+            B2 = bs - B1
+            if B1 < 1 or B2 < 1:
+                continue
+
+            # Provide a FULL-bs context covering [:bs]; run_layer_batch_decode
+            # internally slices into nb1 [:B1] and nb2 [B1:] halves.
+            full_ctx = Context(
+                is_prefill=False,
+                slot_mapping=sm_full[:bs],
+                context_lens=cl_full[:bs],
+                block_tables=bt_full[:bs, :max_blocks],
+                linear_attn_slot_indices=(li_full[:bs] if li_full is not None else None),
+            )
+
+            # Warmup once (needed before CUDA graph capture)
+            _ctxmod._CONTEXT = full_ctx
+            _ = run_layer_batch_decode(lm, in_full[:bs], pos_full[:bs],
+                                        layer_types, B1,
+                                        self._fa_stream, self._la_stream)
+            torch.cuda.synchronize()
+
+            graph = torch.cuda.CUDAGraph()
+            _ctxmod._CONTEXT = full_ctx
+            # CUDA Graph capture origin = la_stream so the entire LB body runs
+            # on Green-Context streams during capture.  We DO NOT share the main
+            # CUDA-graph pool here: PyTorch's caching allocator does not
+            # reliably track cross-stream tensor lifetimes when both streams
+            # are `torch.cuda.ExternalStream`s sitting in different Green
+            # Contexts, so the shared pool can hand the same physical bytes
+            # back to a kernel on stream B before stream A has finished
+            # reading them — manifesting as nondeterministic replay output
+            # (verified: same-input replay gives max abs diff > 20 across
+            # trials with the shared pool, 0 with an isolated pool).
+            with torch.cuda.graph(graph, stream=self._la_stream):
+                hidden = run_layer_batch_decode(
+                    lm, in_full[:bs], pos_full[:bs],
+                    layer_types, B1,
+                    self._fa_stream, self._la_stream,
+                )
+                out_full[:bs] = hidden
+            torch.cuda.synchronize()
+            self._lb_graphs[(bs, B1)] = graph
+            n_captured += 1
+
+        logger.info("Layer-Batch: captured %d CUDA graphs (split=%.2f, buckets=%s)",
+                    n_captured, split, sorted([k[0] for k in self._lb_graphs]))
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)

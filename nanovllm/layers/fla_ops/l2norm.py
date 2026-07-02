@@ -49,7 +49,7 @@ def l2norm_fwd(
     x: torch.Tensor, eps: float = 1e-6, output_dtype: torch.dtype | None = None
 ):
     x_shape_og = x.shape
-    x = x.view(-1, x.shape[-1])
+    x = x.reshape(-1, x.shape[-1])
     if output_dtype is None:
         y = torch.empty_like(x)
     else:
@@ -65,4 +65,4 @@ def l2norm_fwd(
     l2norm_fwd_kernel2[(triton.cdiv(T, MBLOCK),)](
         x, y, eps, T, D, MBLOCK,
     )
-    return y.view(x_shape_og)
+    return y.reshape(x_shape_og)
